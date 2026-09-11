@@ -1,0 +1,102 @@
+# -----------------------------------------------------------------------
+# Exact match for your board: L4T R35.3.1 / JetPack 5.1.1
+# Using the "desktop" variant, not "ros-base": official Humble apt binaries
+# only exist for Ubuntu 22.04 (Jammy), so on this Focal (20.04) board,
+# packages.ros.org has no ros-humble-vision-msgs/cv_bridge/image_transport
+# to install via apt at all -- dustynv compiles them from source instead,
+# and "desktop" (unlike "ros-base") is the variant that includes them.
+FROM dustynv/ros:humble-desktop-l4t-r35.3.1
+# -----------------------------------------------------------------------
+
+# No librealsense / pyrealsense2 needed anymore -- this container only
+# subscribes to image topics published by your already-running realsense node.
+# cv_bridge, vision_msgs, and image_transport are already built into this
+# "desktop" base image -- nothing further to install for those.
+
+# The ROS2 apt signing key baked into this base image has since expired
+# (Open Robotics rotated their key) -- refresh it before running any further
+# apt-get update, or it fails with EXPKEYSIG.
+RUN apt-get update || true && \
+    apt-get install -y --no-install-recommends curl gnupg2 ca-certificates && \
+    ROS_KEYRING=$(grep -ohr 'signed-by=[^]]*' /etc/apt/sources.list.d/*.list | head -n1 | cut -d= -f2) && \
+    echo "Refreshing ROS2 apt key at: ${ROS_KEYRING}" && \
+    curl -sSL https://raw.githubusercontent.com/ros/rosdistro/master/ros.key | gpg --batch --yes --no-tty --dearmor -o "${ROS_KEYRING}" && \
+    apt-get update
+
+RUN apt-get install -y --no-install-recommends \
+    python3-pip \
+    libopenblas-dev \
+    libopenmpi-dev \
+    libomp-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Build rmw_cyclonedds_cpp to match the Go2's native ROS2 stack, which uses
+# Cyclone DDS (confirmed via RMW_IMPLEMENTATION=rmw_cyclonedds_cpp on the
+# host), not the Fast-DDS this base image ships by default. Without this,
+# this container and the host's Foxy nodes/zenoh bridge use incompatible
+# DDS vendors and simply never discover each other's topics -- regardless
+# of matching ROS2 distro versions. No custom cyclonedds.xml was found on
+# the host, so default Cyclone settings (multicast on default interface)
+# apply here too, which works fine under --network host.
+RUN apt-get update && apt-get install -y --no-install-recommends cmake \
+    && rm -rf /var/lib/apt/lists/* && \
+    mkdir -p /opt/cyclonedds_ws/src && \
+    cd /opt/cyclonedds_ws/src && \
+    git clone --depth 1 -b humble https://github.com/ros2/rmw_cyclonedds.git && \
+    git clone --depth 1 -b releases/0.10.x https://github.com/eclipse-cyclonedds/cyclonedds.git && \
+    cd /opt/cyclonedds_ws && \
+    /bin/bash -c "source /opt/ros/humble/install/setup.bash && colcon build --symlink-install --packages-up-to rmw_cyclonedds_cpp"
+
+ENV RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+
+# NVIDIA's L4T-specific PyTorch wheel, verified for JetPack 5.1.1 (L4T r35.3.1),
+# Python 3.8 (cp38, matching this base image's Ubuntu 20.04 / Python 3.8).
+# Do NOT `pip install torch` from PyPI on Jetson -- that gives you a CPU-only
+# build with no CUDA support, and ultralytics will silently run inference on
+# the CPU, which is far too slow for real-time detection.
+RUN pip3 install --no-cache-dir 'numpy==1.24.4' 'typing_extensions>=4.5.0' && \
+    pip3 install --no-cache-dir \
+      https://developer.download.nvidia.com/compute/redist/jp/v511/pytorch/torch-2.0.0+nv23.05-cp38-cp38-linux_aarch64.whl
+
+# torchvision has no prebuilt NVIDIA wheel for JetPack 5 -- must be built from
+# source, matched to the torch version above (torch 2.0.0 -> torchvision 0.15.1
+# per NVIDIA's compatibility matrix). This step is slow (~20-40 min on Orin Nano).
+# FORCE_CUDA + TORCH_CUDA_ARCH_LIST are required -- without them the build
+# silently produces CPU-only ops (e.g. torchvision::nms fails at runtime with
+# "Could not run ... with arguments from the 'CUDA' backend" even though
+# torch itself has CUDA). 8.7 = Jetson Orin's compute capability (SM_87).
+ENV FORCE_CUDA=1
+ENV TORCH_CUDA_ARCH_LIST="8.7"
+ENV MAX_JOBS=2
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential cmake git ninja-build libjpeg-dev libpng-dev \
+    && rm -rf /var/lib/apt/lists/* && \
+    git clone --branch v0.15.1 --depth 1 https://github.com/pytorch/vision torchvision && \
+    cd torchvision && \
+    pip3 install --no-cache-dir --no-build-isolation . && \
+    cd .. && rm -rf torchvision && \
+    python3 -c "import torch, torchvision; print('torchvision OK:', torchvision.__version__)"
+
+# Install ultralytics WITHOUT letting it pull a generic (CPU-only) torch.
+# Longer timeout + retries since this Jetson's network connection can be
+# slow/flaky enough to time out mid-download on larger wheels.
+RUN pip3 install --no-cache-dir --default-timeout=180 --retries 10 ultralytics --no-deps && \
+    pip3 install --no-cache-dir --default-timeout=180 --retries 10 \
+      opencv-python-headless \
+      pandas \
+      pyyaml \
+      matplotlib \
+      seaborn \
+      requests \
+      psutil \
+      tqdm
+
+WORKDIR /workspace
+COPY yolo_subscriber_node.py /workspace/yolo_subscriber_node.py
+COPY entrypoint.sh /workspace/entrypoint.sh
+RUN chmod +x /workspace/entrypoint.sh
+
+# ENTRYPOINT (not CMD) so that args passed after the image name in
+# `docker run image --ros-args -p ...` APPEND to this command instead of
+# replacing it outright.
+ENTRYPOINT ["/workspace/entrypoint.sh"]
